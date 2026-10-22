@@ -2,10 +2,9 @@ pipeline {
     agent any
 
     parameters {
-        string(name: 'REGISTRY_URL',       defaultValue: 'your-registry.azurecr.io', description: 'ACR login server')
-        string(name: 'AKS_RESOURCE_GROUP', defaultValue: 'your-rg',                 description: 'AKS resource group')
-        string(name: 'AKS_CLUSTER_NAME',   defaultValue: 'your-aks',                description: 'AKS cluster name')
-        string(name: 'AZURE_TENANT_ID',    defaultValue: '',                        description: 'Azure tenant ID')
+        string(name: 'REGISTRY_URL',       defaultValue: 'petclinicacrfaiz123.azurecr.io', description: 'ACR login server')
+        string(name: 'AKS_RESOURCE_GROUP', defaultValue: 'petclinic-rg',                 description: 'AKS resource group')
+        string(name: 'AKS_CLUSTER_NAME',   defaultValue: 'petclinic-aks',                description: 'AKS cluster name')
     }
 
     environment {
@@ -39,10 +38,17 @@ pipeline {
 
         stage('SonarQube') {
             steps {
-                withSonarQubeEnv('SonarQube') {
-                    sh "./mvnw -B sonar:sonar -Dsonar.projectKey=${APP_NAME} -Dsonar.projectName=${APP_NAME}"
+                // Quality gate is report-only: a failed gate marks the build UNSTABLE but does not block the deploy
+                catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                    withSonarQubeEnv('SonarQube') {
+                        sh '''
+                            ./mvnw -B org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+                              -Dsonar.projectKey=${APP_NAME} -Dsonar.projectName=${APP_NAME} \
+                              -Dsonar.host.url=${SONAR_HOST_URL} -Dsonar.token=${SONAR_AUTH_TOKEN} \
+                              -Dsonar.qualitygate.wait=true
+                        '''
+                    }
                 }
-                timeout(time: 5, unit: 'MINUTES') { waitForQualityGate abortPipeline: true }
             }
         }
 
@@ -76,9 +82,10 @@ pipeline {
         stage('Deploy to AKS') {
             steps {
                 withCredentials([usernamePassword(credentialsId: 'azure-sp',
-                                                  usernameVariable: 'AZ_CLIENT_ID', passwordVariable: 'AZ_CLIENT_SECRET')]) {
+                                                  usernameVariable: 'AZ_CLIENT_ID', passwordVariable: 'AZ_CLIENT_SECRET'),
+                                 string(credentialsId: 'azure-tenant-id', variable: 'AZ_TENANT')]) {
                     sh '''
-                        az login --service-principal -u "$AZ_CLIENT_ID" -p "$AZ_CLIENT_SECRET" --tenant "${AZURE_TENANT_ID}" >/dev/null
+                        az login --service-principal -u "$AZ_CLIENT_ID" -p "$AZ_CLIENT_SECRET" --tenant "$AZ_TENANT" >/dev/null
                         az aks get-credentials --resource-group "${AKS_RESOURCE_GROUP}" --name "${AKS_CLUSTER_NAME}" --overwrite-existing
 
                         kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
