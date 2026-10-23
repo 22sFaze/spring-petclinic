@@ -1,181 +1,105 @@
-# Spring PetClinic Sample Application [![Build Status](https://github.com/spring-projects/spring-petclinic/actions/workflows/maven-build.yml/badge.svg)](https://github.com/spring-projects/spring-petclinic/actions/workflows/maven-build.yml)[![Build Status](https://github.com/spring-projects/spring-petclinic/actions/workflows/gradle-build.yml/badge.svg)](https://github.com/spring-projects/spring-petclinic/actions/workflows/gradle-build.yml)
+# Spring PetClinic: CI/CD Pipeline to Azure Kubernetes Service
 
-[![Open in Gitpod](https://gitpod.io/button/open-in-gitpod.svg)](https://gitpod.io/#https://github.com/spring-projects/spring-petclinic) [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://github.com/codespaces/new?hide_repo_select=true&ref=main&repo=7517918)
+**Project 5, Azure Cloud Engineering.** A complete Jenkins pipeline that builds, tests, scans and deploys the
+[Spring PetClinic](https://github.com/spring-projects/spring-petclinic) sample application to Azure Kubernetes Service (AKS).
 
-## Understanding the Spring Petclinic application with a few diagrams
+> The original upstream README is kept as [README-upstream.md](README-upstream.md).
 
-See the presentation here:  
-[Spring Petclinic Sample Application (legacy slides)](https://speakerdeck.com/michaelisvy/spring-petclinic-sample-application?slide=20)
+## Architecture
 
-> **Note:** These slides refer to a legacy, pre–Spring Boot version of Petclinic and may not reflect the current Spring Boot–based implementation.  
-> For up-to-date information, please refer to this repository and its documentation.
-
-
-## Run Petclinic locally
-
-Spring Petclinic is a [Spring Boot](https://spring.io/guides/gs/spring-boot) application built using [Maven](https://spring.io/guides/gs/maven/) or [Gradle](https://spring.io/guides/gs/gradle/).
-Java 17 or later is required for the build, and the application can run with Java 17 or newer.
-
-You first need to clone the project locally:
-
-```bash
-git clone https://github.com/spring-projects/spring-petclinic.git
-cd spring-petclinic
 ```
-If you are using Maven, you can start the application on the command-line as follows:
-
-```bash
-./mvnw spring-boot:run
-```
-With Gradle, the command is as follows:
-
-```bash
-./gradlew bootRun
+GitHub (this repo)
+      |
+      v
+Jenkins on an Azure VM  ->  Maven build + tests  ->  SonarQube analysis  ->  Docker build
+      |                                                                          |
+      |                                       Trivy scan (fails on fixable CRITICAL CVEs)
+      |                                                                          |
+      v                                                                          v
+Azure Container Registry (ACR)  <-------------------------------------  push image
+      |
+      v
+Azure Kubernetes Service (AKS)  ->  LoadBalancer  ->  smoke test on /actuator/health
 ```
 
-You can then access the Petclinic at <http://localhost:8080/>.
+## Pipeline stages (`Jenkinsfile`)
 
-<img width="1042" alt="petclinic-screenshot" src="https://cloud.githubusercontent.com/assets/838318/19727082/2aee6d6c-9b8e-11e6-81fe-e889a5ddfded.png">
+| Stage | What it does | Why |
+|---|---|---|
+| Checkout | Clones this repository | Source of truth |
+| Validate tools | Checks Java, Docker, Azure CLI, kubectl, Trivy | Fails fast if the build server is misconfigured |
+| Build & Test | `./mvnw clean verify` (81 tests) | Proves the code compiles and works, including Postgres integration tests |
+| SonarQube | Static analysis and quality gate | Catches bugs and code smells; reported as UNSTABLE if the gate fails |
+| Docker Build | Multi-stage Dockerfile, Java 17, non-root user | Small, reproducible runtime image |
+| Trivy Scan | Scans the image; **fails the build on fixable CRITICAL vulnerabilities** | Security gate before anything is published |
+| Push to ACR | Pushes `:<build number>` and `:latest` | Versioned, traceable images |
+| Deploy to AKS | Applies `k8s/deployment.yaml` and `k8s/service.yaml`, waits for rollout | Automated delivery |
+| Smoke Test | Port-forwards to the service and checks `/actuator/health` | Confirms the deployed app is healthy |
 
-You can, of course, run Petclinic in your favorite IDE.
-See below for more details.
+## What is in this repository (added on top of upstream)
 
-## Building a Container
+| Path | Purpose |
+|---|---|
+| `Jenkinsfile` | The declarative pipeline |
+| `Dockerfile` | Multi-stage build (Maven on Java 17, then a slim JRE image) |
+| `k8s/deployment.yaml`, `k8s/service.yaml` | Kubernetes manifests (2 replicas, probes, resource limits, LoadBalancer) |
+| `scripts/jenkins-vm-setup.sh` | Turns a fresh Ubuntu 22.04 VM into the Jenkins server |
+| `pom.xml` | Dependency overrides that fix the CVEs Trivy reported (see below) |
 
-There is no `Dockerfile` in this project. You can build a container image (if you have a docker daemon) using the Spring Boot build plugin:
+## Azure resources
+
+Everything lives in one resource group so it can be removed in one command.
+
+| Resource | Name | Notes |
+|---|---|---|
+| Resource group | `petclinic-rg` | Canada Central |
+| Container registry | `petclinicacrfaiz123` | Basic SKU |
+| AKS cluster | `petclinic-aks` | 2 nodes, `Standard_D2s_v3`, registry attached |
+| Jenkins VM | `jenkins-vm` | Ubuntu 22.04, `Standard_D2s_v3`, port 8080 open |
+| Service principal | `petclinic-jenkins-sp` | Contributor on the resource group, AcrPush on the registry |
+
+## Setting it up
+
+1. Create the resource group, ACR and AKS cluster (`az group create`, `az acr create`, `az aks create --attach-acr`).
+2. Create a service principal scoped to the resource group and grant it `AcrPush` on the registry.
+3. Create the Jenkins VM and open port 8080.
+4. Run `scripts/jenkins-vm-setup.sh` on the VM with these environment variables (never commit them):
+   `SP_ID`, `SP_SECRET`, `TENANT_ID`, `ADMIN_PASS`, `GIT_URL`.
+   It installs everything and pre-configures Jenkins with credentials, the SonarQube connection and the pipeline job.
+5. Open Jenkins on port 8080, sign in as `admin`, and run **Build with Parameters**.
+
+Secrets are stored as Jenkins credentials (`acr-credentials`, `azure-sp`, `azure-tenant-id`, `sonar-token`) and are
+never written into the repository.
+
+## Problems found and fixed
+
+These came up while getting the pipeline to green, and each one is a real-world lesson.
+
+1. **Jenkins would not start.** The current Jenkins LTS requires Java 21 and refuses to run on Java 17.
+   The VM runs Jenkins on Java 21 while the application is still built with Java 17 inside Docker.
+2. **Two integration tests failed.** `PostgresIntegrationTests` start a database through `docker compose`,
+   which the Ubuntu Docker package does not include. Installing the Compose plugin fixed it (81/81 tests pass).
+3. **Trivy blocked the first deployments.** The image contained fixable CRITICAL vulnerabilities in application
+   libraries: Apache Tomcat (`tomcat-embed-core` 11.0.22) and Spring Framework (`spring-webmvc` 7.0.8), plus a PostgreSQL
+   driver issue. They were fixed by overriding the managed versions in `pom.xml`
+   (`tomcat.version=11.0.25`, `spring-framework.version=7.0.9`, `postgresql.version=42.7.12`).
+   The gate then passed. This is the pipeline doing its job.
+4. **Short Sonar plugin name did not resolve.** The pipeline uses the full coordinates
+   `org.sonarsource.scanner.maven:sonar-maven-plugin:sonar`.
+5. **Credentials were handled safely.** The tenant ID, service principal and tokens come from Jenkins credentials,
+   not from the repository or job parameters.
+
+## Known limitations
+
+- The SonarQube quality gate is report-only, so a failed gate marks the build UNSTABLE but does not stop the deploy.
+- Some HIGH severity findings (for example in Jackson) remain; only CRITICAL findings fail the build.
+- Jenkins is exposed on port 8080 without TLS. Fine for a lab, not for production.
+- The database is the in-memory H2 default. A production setup would use Azure Database for PostgreSQL.
+
+## Clean up
 
 ```bash
-./mvnw spring-boot:build-image
+az group delete -n petclinic-rg --yes --no-wait
 ```
 
-## Running the Container Image
-
-```bash
-docker images | grep petclinic
-docker run -p 8080:8080 docker.io/library/spring-petclinic:latest
-```
-
-## In case you find a bug/suggested improvement for Spring Petclinic
-
-Our issue tracker is available [here](https://github.com/spring-projects/spring-petclinic/issues).
-
-## Database configuration
-
-In its default configuration, Petclinic uses an in-memory database (H2) which
-gets populated at startup with data. The h2 console is exposed at `http://localhost:8080/h2-console`,
-and it is possible to inspect the content of the database using the `jdbc:h2:mem:<uuid>` URL. The UUID is printed at startup to the console.
-
-A similar setup is provided for MySQL and PostgreSQL if a persistent database configuration is needed. Note that whenever the database type changes, the app needs to run with a different profile: `spring.profiles.active=mysql` for MySQL or `spring.profiles.active=postgres` for PostgreSQL. See the [Spring Boot documentation](https://docs.spring.io/spring-boot/how-to/properties-and-configuration.html#howto.properties-and-configuration.set-active-spring-profiles) for more detail on how to set the active profile.
-
-You can start MySQL or PostgreSQL locally with whatever installer works for your OS or use docker:
-
-```bash
-docker run -e MYSQL_USER=petclinic -e MYSQL_PASSWORD=petclinic -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=petclinic -p 3306:3306 mysql:9.7
-```
-
-or
-
-```bash
-docker run -e POSTGRES_USER=petclinic -e POSTGRES_PASSWORD=petclinic -e POSTGRES_DB=petclinic -p 5432:5432 postgres:18.4
-```
-
-Further documentation is provided for [MySQL](https://github.com/spring-projects/spring-petclinic/blob/main/src/main/resources/db/mysql/petclinic_db_setup_mysql.txt)
-and [PostgreSQL](https://github.com/spring-projects/spring-petclinic/blob/main/src/main/resources/db/postgres/petclinic_db_setup_postgres.txt).
-
-Instead of vanilla `docker` you can also use the provided `docker-compose.yml` file to start the database containers. Each one has a service named after the Spring profile:
-
-```bash
-docker compose up mysql
-```
-
-or
-
-```bash
-docker compose up postgres
-```
-
-## Test Applications
-
-At development time we recommend you use the test applications set up as `main()` methods in `PetClinicIntegrationTests` (using the default H2 database and also adding Spring Boot Devtools), `MySqlTestApplication` and `PostgresIntegrationTests`. These are set up so that you can run the apps in your IDE to get fast feedback and also run the same classes as integration tests against the respective database. The MySql integration tests use Testcontainers to start the database in a Docker container, and the Postgres tests use Docker Compose to do the same thing.
-
-## Compiling the CSS
-
-There is a `petclinic.css` in `src/main/resources/static/resources/css`. It was generated from the `petclinic.scss` source, combined with the [Bootstrap](https://getbootstrap.com/) library. If you make changes to the `scss`, or upgrade Bootstrap, you will need to re-compile the CSS resources using the Maven profile "css", i.e. `./mvnw package -P css`. There is no build profile for Gradle to compile the CSS.
-
-## Working with Petclinic in your IDE
-
-### Prerequisites
-
-The following items should be installed in your system:
-
-- Java 17 or newer (full JDK, not a JRE)
-- [Git command line tool](https://help.github.com/articles/set-up-git)
-- Your preferred IDE
-  - Eclipse with the m2e plugin. Note: when m2e is available, there is a m2 icon in `Help -> About` dialog. If m2e is
-  not there, follow the installation process [here](https://www.eclipse.org/m2e/)
-  - [Spring Tools Suite](https://spring.io/tools) (STS)
-  - [IntelliJ IDEA](https://www.jetbrains.com/idea/)
-  - [VS Code](https://code.visualstudio.com)
-
-### Steps
-
-1. On the command line run:
-
-    ```bash
-    git clone https://github.com/spring-projects/spring-petclinic.git
-    ```
-
-1. Inside Eclipse or STS:
-
-    Open the project via `File -> Import -> Maven -> Existing Maven project`, then select the root directory of the cloned repo.
-
-    Then either build on the command line `./mvnw generate-resources` or use the Eclipse launcher (right-click on project and `Run As -> Maven install`) to generate the CSS. Run the application's main method by right-clicking on it and choosing `Run As -> Java Application`.
-
-1. Inside IntelliJ IDEA:
-
-    In the main menu, choose `File -> Open` and select the Petclinic [pom.xml](pom.xml). Click on the `Open` button.
-
-    - CSS files are generated from the Maven build. You can build them on the command line `./mvnw generate-resources` or right-click on the `spring-petclinic` project then `Maven -> Generates sources and Update Folders`.
-
-    - A run configuration named `PetClinicApplication` should have been created for you if you're using a recent Ultimate version. Otherwise, run the application by right-clicking on the `PetClinicApplication` main class and choosing `Run 'PetClinicApplication'`.
-
-1. Navigate to the Petclinic
-
-    Visit [http://localhost:8080](http://localhost:8080) in your browser.
-
-## Looking for something in particular?
-
-|Spring Boot Configuration | Class or Java property files  |
-|--------------------------|---|
-|The Main Class | [PetClinicApplication](https://github.com/spring-projects/spring-petclinic/blob/main/src/main/java/org/springframework/samples/petclinic/PetClinicApplication.java) |
-|Properties Files | [application.properties](https://github.com/spring-projects/spring-petclinic/blob/main/src/main/resources) |
-|Caching | [CacheConfiguration](https://github.com/spring-projects/spring-petclinic/blob/main/src/main/java/org/springframework/samples/petclinic/system/CacheConfiguration.java) |
-
-## Interesting Spring Petclinic branches and forks
-
-The Spring Petclinic "main" branch in the [spring-projects](https://github.com/spring-projects/spring-petclinic)
-GitHub org is the "canonical" implementation based on Spring Boot and Thymeleaf. There are
-[quite a few forks](https://spring-petclinic.github.io/docs/forks.html) in the GitHub org
-[spring-petclinic](https://github.com/spring-petclinic). If you are interested in using a different technology stack to implement the Pet Clinic, please join the community there.
-
-## Interaction with other open-source projects
-
-One of the best parts about working on the Spring Petclinic application is that we have the opportunity to work in direct contact with many Open Source projects. We found bugs/suggested improvements on various topics such as Spring, Spring Data, Bean Validation and even Eclipse! In many cases, they've been fixed/implemented in just a few days.
-Here is a list of them:
-
-| Name | Issue |
-|------|-------|
-| Spring JDBC: simplify usage of NamedParameterJdbcTemplate | [SPR-10256](https://github.com/spring-projects/spring-framework/issues/14889) and [SPR-10257](https://github.com/spring-projects/spring-framework/issues/14890) |
-| Bean Validation / Hibernate Validator: simplify Maven dependencies and backward compatibility |[HV-790](https://hibernate.atlassian.net/browse/HV-790) and [HV-792](https://hibernate.atlassian.net/browse/HV-792) |
-| Spring Data: provide more flexibility when working with JPQL queries | [DATAJPA-292](https://github.com/spring-projects/spring-data-jpa/issues/704) |
-
-## Contributing
-
-The [issue tracker](https://github.com/spring-projects/spring-petclinic/issues) is the preferred channel for bug reports, feature requests and submitting pull requests.
-
-For pull requests, editor preferences are available in the [editor config](.editorconfig) for easy use in common text editors. Read more and download plugins at <https://editorconfig.org>. All commits must include a __Signed-off-by__ trailer at the end of each commit message to indicate that the contributor agrees to the Developer Certificate of Origin.
-For additional details, please refer to the blog post [Hello DCO, Goodbye CLA: Simplifying Contributions to Spring](https://spring.io/blog/2025/01/06/hello-dco-goodbye-cla-simplifying-contributions-to-spring).
-
-## License
-
-The Spring PetClinic sample application is released under version 2.0 of the [Apache License](https://www.apache.org/licenses/LICENSE-2.0).
+This removes the cluster, registry and VM, and stops all charges.
