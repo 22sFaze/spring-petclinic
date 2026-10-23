@@ -1,6 +1,6 @@
 #!/bin/bash
 # Sets up a fresh Ubuntu 22.04 VM as the Jenkins server for the Spring PetClinic -> AKS pipeline.
-# Installs: Java 17, Docker, Azure CLI, kubectl, Trivy, SonarQube (container), Jenkins (pre-configured).
+# Installs: Java 21 (required by current Jenkins LTS), Docker + Compose plugin, Azure CLI, kubectl, Trivy, SonarQube (container), Jenkins (pre-configured).
 # Secrets are passed as environment variables by the caller and are NOT stored in this repo:
 #   SP_ID SP_SECRET TENANT_ID (Azure service principal)   ADMIN_PASS (Jenkins/Sonar admin password)
 #   GIT_URL (app repo to build)
@@ -9,10 +9,17 @@ export DEBIAN_FRONTEND=noninteractive
 
 : "${SP_ID:?}" "${SP_SECRET:?}" "${TENANT_ID:?}" "${ADMIN_PASS:?}" "${GIT_URL:?}"
 
-echo "=== 1. Base packages, Java 17, Docker ==="
+echo "=== 1. Base packages, Java 21, Docker + Compose ==="
 apt-get update
-apt-get install -y openjdk-17-jdk docker.io curl wget git jq unzip gnupg lsb-release ca-certificates apt-transport-https
+apt-get install -y openjdk-21-jdk docker.io curl wget git jq unzip gnupg lsb-release ca-certificates apt-transport-https
 systemctl enable --now docker
+update-alternatives --set java /usr/lib/jvm/java-21-openjdk-amd64/bin/java
+# Docker Compose plugin: the PetClinic Postgres integration tests start their DB through "docker compose"
+mkdir -p /usr/local/lib/docker/cli-plugins
+curl -fsSL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 \
+  -o /usr/local/lib/docker/cli-plugins/docker-compose
+chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+docker compose version
 
 echo "=== 2. Azure CLI + kubectl ==="
 curl -sL https://aka.ms/InstallAzureCLIDeb | bash
