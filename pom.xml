@@ -19,6 +19,7 @@
     <java.version>17</java.version>
     <!-- Security: override Spring Boot managed versions to pick up fixes for CVEs reported by Trivy -->
     <tomcat.version>11.0.25</tomcat.version>
+    <spring-framework.version>7.0.9</spring-framework.version>
     <postgresql.version>42.7.12</postgresql.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
